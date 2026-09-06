@@ -353,21 +353,21 @@ class MyPlugin(PluginInterface):
   <tr>
     <td width="50%" align="center">
       <img src="assets/screenshots/login.png" alt="登录页" /><br/>
-      <sub><b>登录页</b></sub>
+      <sub><b>仪表盘</b></sub>
     </td>
     <td width="50%" align="center">
       <img src="assets/screenshots/dashboard.png" alt="监控仪表盘" /><br/>
-      <sub><b>监控仪表盘</b></sub>
+      <sub><b>插件管理</b></sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
       <img src="assets/screenshots/plugins.png" alt="插件市场" /><br/>
-      <sub><b>插件市场</b></sub>
+      <sub><b>权限管理</b></sub>
     </td>
     <td width="50%" align="center">
       <img src="assets/screenshots/system.png" alt="系统管理" /><br/>
-      <sub><b>系统管理</b></sub>
+      <sub><b>MCP管理</b></sub>
     </td>
   </tr>
 </table>
