@@ -112,12 +112,23 @@
   <!-- Upload Dialog -->
   <el-dialog v-model="uploadVisible" title="导入插件包" width="520px">
     <el-alert
-      title="插件包格式：.zip 压缩包，内含 plugin.json 清单和插件包目录（含 __init__.py）"
+      title="Python 版底座插件包：.zip 压缩包，内含 plugin.json 清单和插件包目录（含 __init__.py）"
       type="info"
+      :closable="false"
+      show-icon
+      style="margin-bottom: 8px"
+    />
+    <el-alert
+      v-if="pkgKindWarning"
+      :title="pkgKindWarning"
+      type="warning"
       :closable="false"
       show-icon
       style="margin-bottom: 16px"
     />
+    <p v-else style="margin: 0 0 16px; font-size: 12px; color: #909399">
+      注意：Go 版（ApeAdmin-Gin）的 L2 插件包（type=l2）无法安装到本系统，请勿混用。
+    </p>
     <el-upload
       drag
       :auto-upload="false"
@@ -134,7 +145,7 @@
     </el-upload>
     <template #footer>
       <el-button @click="uploadVisible = false">取消</el-button>
-      <el-button type="primary" :loading="uploading" :disabled="!uploadingFile" @click="handleUpload">
+      <el-button type="primary" :loading="uploading" :disabled="!uploadingFile || !!pkgKindError" @click="handleUpload">
         上传并安装
       </el-button>
     </template>
@@ -155,6 +166,7 @@ import {
   restartServer,
   deletePlugin,
 } from '@/api'
+import { pollBackendHealth } from '@/utils/restart'
 
 interface PluginRow {
   id: number
@@ -227,9 +239,8 @@ async function handleToggle(item: PluginRow, val: boolean) {
     if (result?.refresh) await refreshRuntimeMenus()
     ElMessage.success(`${val ? '启用' : '禁用'}成功，运行时已生效`)
   } catch {
-    // Revert on error
+    // Revert on error — the axios interceptor already showed the message.
     item.enabled = !val
-    ElMessage.error('操作失败')
   } finally {
     togglingId.value = null
   }
@@ -273,17 +284,105 @@ function formatTime(t: string) {
   return t.replace('T', ' ').slice(0, 19)
 }
 
-// ---- Upload ----
-function handleFileSelect(file: File) {
+// ---- Upload: client-side package-kind pre-check ----
+// Reads the zip central directory in the browser (no upload needed) to
+// detect a Go-stack (ApeAdmin-Gin) L2 package and block it early with an
+// actionable message, matching the backend guard in pkgdetect.py.
+const pkgKindError = ref('')
+const pkgKindWarning = ref('')
+
+async function detectZipKind(file: File): Promise<'go' | 'python' | 'unknown'> {
+  try {
+    const buf = await file.slice(0, Math.min(file.size, 4 * 1024 * 1024)).arrayBuffer()
+    const view = new DataView(buf)
+    // Locate End of Central Directory (EOCD) signature 0x06054b50.
+    let eocd = -1
+    for (let i = view.byteLength - 22; i >= Math.max(0, view.byteLength - 66000); i--) {
+      if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break }
+    }
+    if (eocd < 0) return 'unknown'
+    const entryCount = view.getUint16(eocd + 10, true)
+    const cdSize = view.getUint32(eocd + 12, true)
+    const cdOffset = view.getUint32(eocd + 16, true)
+    if (cdOffset + cdSize > file.size) return 'unknown'
+    // Central directory may start beyond the sliced prefix; re-slice it.
+    const cdBuf = await file.slice(cdOffset, cdOffset + cdSize).arrayBuffer()
+    const cd = new DataView(cdBuf)
+    const decoder = new TextDecoder()
+    let hasPluginJson = false
+    let manifestType = ''
+    let hasInit = false
+    let hasMenuAssets = false
+    let hasGoBinary = false
+    let offset = 0
+    for (let i = 0; i < entryCount; i++) {
+      if (offset + 46 > cd.byteLength || cd.getUint32(offset, true) !== 0x02014b50) break
+      const nameLen = cd.getUint16(offset + 28, true)
+      const extraLen = cd.getUint16(offset + 30, true)
+      const commentLen = cd.getUint16(offset + 32, true)
+      const name = decoder.decode(new Uint8Array(cdBuf, offset + 46, nameLen))
+      offset += 46 + nameLen + extraLen + commentLen
+      const base = name.split('/').pop() || ''
+      const dirDepth = name.split('/').length - (name.endsWith('/') ? 1 : 0)
+      if (base === 'plugin.json' && dirDepth <= 1) hasPluginJson = true
+      if (base === '__init__.py') hasInit = true
+      if (base === 'menu.json' || base === 'seed.sql') hasMenuAssets = true
+      const ext = base.includes('.') ? base.slice(base.lastIndexOf('.')).toLowerCase() : ''
+      if (['.so', '.dll', '.exe', '.bin'].includes(ext)) hasGoBinary = true
+    }
+    if (hasPluginJson) {
+      // Read the manifest only if it lives inside the sliced prefix.
+      if (manifestType === '') manifestType = '' // (kept simple: type detection below)
+    }
+    // Manifest content: try to read plugin.json from the prefix slice.
+    if (hasPluginJson) {
+      try {
+        // Cheap approach: scan raw prefix bytes for "type":"l2" style JSON.
+        const text = decoder.decode(new Uint8Array(buf))
+        const m = text.match(/"type"\s*:\s*"([^"]+)"/)
+        if (m) manifestType = m[1].toLowerCase()
+      } catch { /* ignore */ }
+    }
+    if (manifestType === 'l2') return 'go'
+    if (hasPluginJson) {
+      if (hasInit) return 'python'
+      if (hasMenuAssets) return 'go'
+      return 'python' // legacy python manifests have no type field
+    }
+    if (hasGoBinary && !hasInit) return 'go'
+    if (hasInit) return 'python'
+    return 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+async function handleFileSelect(file: File) {
   if (!file.name.toLowerCase().endsWith('.zip')) {
     ElMessage.error('仅支持 .zip 格式的插件包')
     return
+  }
+  pkgKindError.value = ''
+  pkgKindWarning.value = ''
+  const kind = await detectZipKind(file)
+  if (kind === 'go') {
+    pkgKindError.value =
+      '检测到 Go 版（ApeAdmin-Gin）L2 插件包，无法安装到 Python 版底座，请到 ApeAdmin-Gin 后台导入。'
+    pkgKindWarning.value = pkgKindError.value
+    ElMessage.error(pkgKindError.value)
+    return
+  }
+  if (kind === 'unknown') {
+    pkgKindWarning.value =
+      '无法识别包结构，请确认这是 Python 版插件包（plugin.json + 插件目录含 __init__.py）'
   }
   uploadingFile.value = file
 }
 
 function handleFileRemove() {
   uploadingFile.value = null
+  pkgKindError.value = ''
+  pkgKindWarning.value = ''
 }
 
 async function handleUpload() {
@@ -299,8 +398,8 @@ async function handleUpload() {
     uploadVisible.value = false
     uploadingFile.value = null
     fetchData()
-  } catch (err: any) {
-    ElMessage.error(err?.message || '上传失败')
+  } catch {
+    // axios interceptor already displayed the error message.
   } finally {
     uploading.value = false
   }
@@ -321,63 +420,26 @@ async function handleRestart() {
   restarting.value = true
   ElMessage.info('正在重启后端...')
   let oldPid: number | undefined
+  let restartRequestFailed = false
   try {
     const result: any = await restartServer()
     oldPid = result?.old_pid
   } catch {
-    // Response may fail if server is already shutting down — expected
+    // Response may fail if the server is already shutting down — expected.
+    // But it may also fail BEFORE the restart was ever issued (network error,
+    // permission error...), in which case we must not blindly wait.
+    restartRequestFailed = true
   }
 
-  // Poll health endpoint until server is back
-  await pollHealth(oldPid)
-}
-
-async function pollHealth(oldPid?: number) {
-  const maxRetries = 60
-  const interval = 1000 // 1s
-  let healthyPid: number | undefined
-  let consecutiveSuccesses = 0
-
-  // Give the old process enough time to exit before accepting a health response.
-  await new Promise((resolve) => setTimeout(resolve, 2000))
-
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      const res = await fetch(`/api/v1/health?t=${Date.now()}`, {
-        method: 'GET',
-        cache: 'no-store',
-      })
-      if (res.ok) {
-        const body = await res.json()
-        const currentPid = Number(body?.data?.pid)
-        const isNewProcess = Number.isFinite(currentPid) && (!oldPid || currentPid !== oldPid)
-
-        if (isNewProcess) {
-          if (healthyPid === currentPid) consecutiveSuccesses += 1
-          else {
-            healthyPid = currentPid
-            consecutiveSuccesses = 1
-          }
-
-          // Require the same new process to stay healthy across multiple polls.
-          if (consecutiveSuccesses >= 2) {
-            ElMessage.success('后端已恢复，正在刷新...')
-            restarting.value = false
-            await new Promise((resolve) => setTimeout(resolve, 500))
-            window.location.reload()
-            return
-          }
-        }
-      }
-    } catch {
-      // Server still down, keep polling
-      healthyPid = undefined
-      consecutiveSuccesses = 0
-    }
-    await new Promise((resolve) => setTimeout(resolve, interval))
+  const result = await pollBackendHealth({ oldPid, requestFailed: restartRequestFailed })
+  if (result.recovered) {
+    ElMessage.success('后端已恢复，正在刷新...')
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    window.location.reload()
+  } else {
+    ElMessage.error('后端在 60 秒内未恢复，请检查后端日志')
+    restarting.value = false
   }
-  ElMessage.error('后端在 60 秒内未恢复，请检查后端日志')
-  restarting.value = false
 }
 
 // ---- Delete ----
@@ -397,8 +459,8 @@ async function handleDelete(item: PluginRow) {
     await refreshRuntimeMenus()
     ElMessage.success('插件已卸载，运行时已生效')
     fetchData()
-  } catch (err: any) {
-    ElMessage.error(err?.message || '删除失败')
+  } catch {
+    // axios interceptor already displayed the error message.
   }
 }
 

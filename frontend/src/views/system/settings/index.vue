@@ -179,6 +179,7 @@ import { useTheme } from '@/composables/useTheme'
 import { useSettingsStore } from '@/stores/settings'
 import { getSettings, updateSettings, restartServer } from '@/api'
 import request from '@/api/request'
+import { pollBackendHealth } from '@/utils/restart'
 
 const { isDark, applyDark } = useTheme()
 const settingsStore = useSettingsStore()
@@ -316,7 +317,7 @@ async function handleSave() {
     settingsStore.applySidebarTheme()
     ElMessage.success('设置已保存' + (adminPathChanged ? '（后台路径修改需重启后端生效）' : ''))
   } catch {
-    ElMessage.error('保存失败')
+    // axios interceptor already displayed the error message.
   } finally {
     saving.value = false
   }
@@ -334,30 +335,25 @@ async function handleRestart() {
   }
 
   restarting.value = true
+  let oldPid: number | undefined
+  let restartRequestFailed = false
   try {
-    await restartServer()
+    const result: any = await restartServer()
+    oldPid = result?.old_pid
     ElMessage.success('后端正在重启...')
-
-    // Poll health check
-    for (let i = 0; i < 30; i++) {
-      await new Promise(r => setTimeout(r, 1000))
-      try {
-        const resp = await fetch('/api/v1/health', { method: 'GET' })
-        if (resp.ok) {
-          ElMessage.success('后端已恢复')
-          break
-        }
-      } catch {
-        // still restarting
-      }
-    }
   } catch {
-    ElMessage.error('重启请求失败')
-  } finally {
-    restarting.value = false
-    // Reload settings after restart
-    await loadSettings()
+    restartRequestFailed = true
   }
+
+  const result = await pollBackendHealth({ oldPid, requestFailed: restartRequestFailed })
+  if (result.recovered) {
+    ElMessage.success('后端已恢复')
+  } else {
+    ElMessage.error('后端在 60 秒内未恢复，请检查后端日志')
+  }
+  restarting.value = false
+  // Reload settings after restart
+  await loadSettings()
 }
 
 onMounted(async () => {

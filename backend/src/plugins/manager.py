@@ -712,8 +712,23 @@ class PluginManager:
         if not zip_path.exists() or not zipfile.is_zipfile(zip_path):
             raise ValueError("文件不是有效的 zip 压缩包")
 
+        # Cross-stack guard FIRST: a Go (ApeAdmin-Gin) L2 package would
+        # otherwise fail later with a confusing "未找到 __init__.py" error.
+        from src.core.pkgdetect import detect_zip_kind, mismatch_message
+
+        zip_kind = detect_zip_kind(zip_path)
+        hint = mismatch_message(zip_kind, "plugin-upload")
+        if hint:
+            raise ValueError(hint)
+
         with zipfile.ZipFile(zip_path, "r") as zf:
             names = zf.namelist()
+
+            # Security: reject zip bombs — limit total uncompressed size and
+            # entry count so a 50MB archive can't expand to fill the disk.
+            total_uncompressed = sum(info.file_size for info in zf.infolist())
+            if total_uncompressed > 500 * 1024 * 1024 or len(names) > 50_000:
+                raise ValueError("压缩包解压后体积过大或文件数过多，疑似恶意包")
 
             # Find plugin.json (at top level or inside a single root directory)
             json_candidates = [

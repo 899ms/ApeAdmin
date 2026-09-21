@@ -52,6 +52,7 @@ export const uploadPlugin = (file: File) => {
   formData.append('file', file)
   return request.post('/plugins/upload', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 120000, // 2 min for large plugin packages (up to 50 MB)
   })
 }
 export const restartServer = () => request.post('/plugins/restart')

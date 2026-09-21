@@ -39,7 +39,10 @@ request.interceptors.response.use(
       // 如果已在登录页，不跳转也不弹消息，由调用方（如 handleLogin）处理错误提示
       if (!window.location.pathname.includes('/login')) {
         ElMessage.error('登录已过期，请重新登录')
-        window.location.href = '/admin/login'
+        // 保留当前 admin_path 前缀（可能被用户修改过，不是默认 /admin）
+        const currentPath = window.location.pathname
+        const loginPath = currentPath.replace(/\/[^/]*$/, '/login') || '/admin/login'
+        window.location.href = loginPath
       }
     } else {
       const msg = error.response?.data?.msg || error.message || '网络错误'

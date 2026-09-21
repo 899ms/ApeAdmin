@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Annotated
 
@@ -196,12 +197,16 @@ async def upload_plugin(
     if len(content) > _MAX_UPLOAD_SIZE:
         raise ValidationException("插件包大小不能超过 50MB")
 
-    # Save to temp file
+    # Save to temp file (in a worker thread: a 50MB sync write would block the event loop)
+    from fastapi.concurrency import run_in_threadpool
+
     upload_dir = Path(settings.PLUGINS_UPLOAD_DIR)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    tmp_path = upload_dir / f"upload_{filename}"
-    tmp_path.write_bytes(content)
+    # Never build the on-disk path from the client-supplied filename: it can
+    # contain path separators ("../../x.zip") and escape the upload directory.
+    tmp_path = upload_dir / f"upload_{uuid.uuid4().hex}.zip"
+    await run_in_threadpool(tmp_path.write_bytes, content)
 
     # Import, install and register the plugin package in the current process.
     from src.plugins.manager import plugin_manager
@@ -245,6 +250,7 @@ async def upload_plugin(
 
 @router.post("/restart")
 async def restart_server(
+    request: Request,
     user: Annotated[User, Depends(require_permission("system:plugin:restart"))],
 ):
     """Restart the backend server process.
@@ -272,13 +278,16 @@ async def restart_server(
         f"pid={restart_info['spawner_pid']}), shutting down in 1s..."
     )
 
-    # Schedule self-termination after a short delay (let the response go out)
+    # Schedule self-termination after a short delay (let the response go out).
+    # Keep a strong reference on app.state: the event loop only holds a weak
+    # reference to tasks, so an unreferenced task may be garbage-collected and
+    # the scheduled restart would silently never happen.
     async def _delayed_exit():
         await asyncio.sleep(1)
         logger.info("Backend restarting now...")
         os._exit(0)
 
-    asyncio.create_task(_delayed_exit())
+    request.app.state.restart_task = asyncio.create_task(_delayed_exit())
 
     return success_response(
         data={

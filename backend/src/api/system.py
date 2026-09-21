@@ -19,8 +19,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Request, UploadFile
 from loguru import logger
+from starlette.concurrency import run_in_threadpool
 
 from src.core.config import settings
 from src.core.deps import require_permission
@@ -36,6 +37,19 @@ _MAX_PKG_SIZE = 200 * 1024 * 1024
 
 # Allowed extensions
 _ALLOWED_EXTS = {".tar.gz", ".tgz"}
+
+
+def _extract_update_package(tmp_pkg: Path, extract_dir: Path) -> None:
+    """Extract a pre-validated tar.gz package (called in a worker thread)."""
+    with tarfile.open(tmp_pkg, "r:gz") as tar:
+        tar.extractall(str(extract_dir))
+
+
+def _replace_directory(src: Path, dst: Path) -> None:
+    """Atomically replace ``dst`` with ``src`` (called in a worker thread)."""
+    if dst.exists():
+        shutil.rmtree(str(dst))
+    shutil.copytree(str(src), str(dst))
 
 
 @router.get("/version")
@@ -54,12 +68,17 @@ async def get_version(
         "project_root": str(project_root),
         "has_env": env_file.exists(),
         "pid": os.getpid(),
+        # Base-stack identity: "python" (FastAPI) — the Go base
+        # (ApeAdmin-Gin) reports "go". The frontend uses it to warn when a
+        # package built for the other stack is uploaded.
+        "runtime": "python",
     })
 
 
 @router.post("/update")
 async def upload_update(
     file: UploadFile = File(..., description="部署包 .tar.gz 文件"),
+    request: Request = None,  # type: ignore
     user: Annotated[User, Depends(require_permission("system:version:update"))] = None,  # type: ignore
 ):
     """Upload a new deploy package and perform an in-place update.
@@ -100,7 +119,8 @@ async def upload_update(
     tmp_dir = Path(tempfile.gettempdir()) / "apeadmin_update"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_pkg = tmp_dir / f"update_{int(time.time())}.tar.gz"
-    tmp_pkg.write_bytes(content)
+    # A 200MB sync write would block the event loop for seconds.
+    await run_in_threadpool(tmp_pkg.write_bytes, content)
     logger.info(f"Update package saved: {tmp_pkg} ({len(content)} bytes)")
 
     # ---- Validate tar.gz structure ----
@@ -114,7 +134,27 @@ async def upload_update(
             for member in tar.getmembers():
                 if member.name.startswith("/") or ".." in member.name:
                     raise ValidationException(f"非法路径: {member.name}")
-            tar.extractall(str(extract_dir))
+            # Security: reject archive bombs (zip of highly compressible data).
+            # Limit total uncompressed size to 1 GB, single files to 500 MB,
+            # and member count to 50k entries.
+            total_uncompressed = sum(m.size for m in tar.getmembers())
+            if total_uncompressed > 1024 * 1024 * 1024 or len(tar.getmembers()) > 50_000:
+                raise ValidationException("部署包解压后体积过大或文件数过多，疑似恶意包")
+
+        # Cross-stack guard: users occasionally upload a plugin package
+        # (or a Go-stack archive) where a deploy package is expected.
+        # Fail early with an actionable message instead of a generic
+        # "缺少 src/ 目录" error.  The plain "unknown" case keeps the
+        # original explicit structural error below.
+        from src.core.pkgdetect import detect_tar_gz_kind, mismatch_message
+
+        pkg_kind = detect_tar_gz_kind(tmp_pkg)
+        if pkg_kind in {"plugin", "go-binary"}:
+            hint = mismatch_message(pkg_kind, "system-update")
+            if hint:
+                raise ValidationException(hint)
+
+        await run_in_threadpool(_extract_update_package, tmp_pkg, extract_dir)
     except tarfile.ReadError:
         raise ValidationException("无法解压，请检查文件是否为有效的 .tar.gz 包")
     except ValidationException:
@@ -135,7 +175,9 @@ async def upload_update(
     # ---- Backup current code ----
     backup_dir = project_root.parent / f"apeadmin_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     logger.info(f"Backing up current code to {backup_dir}")
-    shutil.copytree(
+    # A full-tree copy is heavy disk IO; run it in a worker thread.
+    await run_in_threadpool(
+        shutil.copytree,
         str(project_root),
         str(backup_dir),
         dirs_exist_ok=True,
@@ -151,20 +193,14 @@ async def upload_update(
     src_dst = project_root / "src"
     if src_src.is_dir():
         logger.info("Overwriting src/ ...")
-        # Remove old src contents (but keep plugins/builtin uploads if any)
-        # Actually, full overwrite is cleaner for version updates
-        if src_dst.exists():
-            shutil.rmtree(str(src_dst))
-        shutil.copytree(str(src_src), str(src_dst))
+        await run_in_threadpool(_replace_directory, src_src, src_dst)
 
     # 2. Copy frontend_dist/ (built frontend)
     fe_src = pkg_root / "frontend_dist"
     fe_dst = project_root / "frontend_dist"
     if fe_src.is_dir():
         logger.info("Overwriting frontend_dist/ ...")
-        if fe_dst.exists():
-            shutil.rmtree(str(fe_dst))
-        shutil.copytree(str(fe_src), str(fe_dst))
+        await run_in_threadpool(_replace_directory, fe_src, fe_dst)
 
     # 3. Copy requirements.txt
     req_src = pkg_root / "requirements.txt"
@@ -178,9 +214,7 @@ async def upload_update(
     scripts_dst = project_root / "scripts"
     if scripts_src.is_dir():
         logger.info("Overwriting scripts/ ...")
-        if scripts_dst.exists():
-            shutil.rmtree(str(scripts_dst))
-        shutil.copytree(str(scripts_src), str(scripts_dst))
+        await run_in_threadpool(_replace_directory, scripts_src, scripts_dst)
 
     # ---- Install new dependencies ----
     if req_dst.exists():
@@ -225,11 +259,8 @@ async def upload_update(
     tmp_pkg.unlink(missing_ok=True)
 
     # ---- Spawn restart script (cross-platform, see src/core/runtime.py) ----
-    import asyncio
-
     from src.core.runtime import spawn_restart
 
-    project_root = Path(__file__).resolve().parents[2]  # backend/ or deploy root
     python_bin = sys.executable
     restart_info = await spawn_restart(project_root, python_bin)
     logger.info(
@@ -237,13 +268,15 @@ async def upload_update(
         f"pid={restart_info['spawner_pid']}), shutting down in 1s..."
     )
 
-    # Schedule self-termination
+    # Schedule self-termination. Keep a strong reference on request.app.state:
+    # the event loop only holds a weak reference to tasks, so an unreferenced
+    # task may be garbage-collected and the scheduled exit would never run.
     async def _delayed_exit():
         await asyncio.sleep(1)
         logger.info("Backend restarting after update...")
         os._exit(0)
 
-    asyncio.create_task(_delayed_exit())
+    request.app.state.update_restart_task = asyncio.create_task(_delayed_exit())
 
     return success_response(
         data={

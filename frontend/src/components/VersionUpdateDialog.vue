@@ -20,6 +20,10 @@
         <span class="version-value">{{ versionData?.app_name || '--' }}</span>
       </div>
       <div class="version-row">
+        <span class="version-label">底座类型</span>
+        <span class="version-value">{{ runtimeLabel }}</span>
+      </div>
+      <div class="version-row">
         <span class="version-label">Python</span>
         <span class="version-value">{{ versionData?.python_version || '--' }}</span>
       </div>
@@ -43,7 +47,7 @@
       </div>
       <template #tip>
         <div class="el-upload__tip">
-          仅支持 .tar.gz 格式部署包，最大 200MB
+          仅支持 Python 版 .tar.gz 升级包（build_deploy_package.sh 生成），最大 200MB；插件包（含 plugin.json）请到「插件管理 → 导入插件」
         </div>
       </template>
     </el-upload>
@@ -92,10 +96,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import type { UploadFile, UploadFiles, UploadRawFile } from 'element-plus'
 import { getSystemVersion, uploadSystemUpdate } from '@/api'
+import { pollBackendHealth } from '@/utils/restart'
 
 const props = defineProps<{
   modelValue: boolean
@@ -119,11 +124,20 @@ watch(visible, (val) => {
 const loading = ref(false)
 const versionData = ref<any>(null)
 
+// Base-stack identity label: backend reports runtime="python"|"go".
+const runtimeLabel = computed(() => {
+  const rt = String(versionData.value?.runtime || 'python').toLowerCase()
+  if (rt === 'go') return 'Go 版（ApeAdmin-Gin）'
+  if (rt === 'python') return 'Python 版（FastAPI）'
+  return rt || '--'
+})
+
 async function fetchVersion() {
   loading.value = true
   try {
-    const res = await getSystemVersion()
-    versionData.value = res.data?.data || res.data
+    const res: any = await getSystemVersion()
+    // axios 拦截器已解包标准信封，res 就是 data 本体（含 current_version 等字段）
+    versionData.value = res || null
   } catch (err: any) {
     // silently fail, show -- placeholders
     console.error('Failed to fetch version:', err)
@@ -185,7 +199,7 @@ async function handleUpload() {
   successMsg.value = ''
 
   try {
-    const res = await uploadSystemUpdate(selectedFile.value, (pct: number) => {
+    const res: any = await uploadSystemUpdate(selectedFile.value, (pct: number) => {
       progress.value = pct
       if (pct < 100) {
         progressText.value = `上传中... ${pct}%`
@@ -198,55 +212,41 @@ async function handleUpload() {
     progress.value = 100
     progressStatus.value = 'success'
     progressText.value = '更新完成，后端正在重启...'
-    successMsg.value = res.data?.message || '版本更新完成，后端正在重启，请等待约 5 秒后刷新页面'
+    // axios 拦截器已解包标准信封：res 直接就是 data（含 old_pid / message）
+    successMsg.value = res?.message || '版本更新完成，后端正在重启，请等待约 5 秒后刷新页面'
 
-    // Poll health check after 3 seconds
-    setTimeout(() => {
-      progressText.value = '等待后端重启完成...'
-      pollHealth()
-    }, 3000)
-  } catch (err: any) {
+    // Poll health: wait for the new process to come up (old PID known).
+    progressText.value = '等待后端重启完成...'
+    const oldPid = res?.old_pid
+    const pollResult = await pollBackendHealth({
+      oldPid,
+      maxRetries: 30,
+      interval: 2000,
+      onProbe: (isDown, _pid, attempt) => {
+        if (isDown) {
+          progressText.value = `等待后端重启完成... (${attempt}/30)`
+        }
+      },
+    })
+    if (pollResult.recovered) {
+      progressText.value = '后端已恢复，正在刷新页面...'
+      uploading.value = false
+      setTimeout(() => window.location.reload(), 1000)
+    } else {
+      progressText.value = '后端重启超时，请手动刷新页面'
+      uploading.value = false
+    }
+    } catch (err: any) {
     progressStatus.value = 'exception'
-    errorMsg.value = err?.response?.data?.detail?.msg
+    // Backend returns { code, msg, data } in the standard envelope.
+    errorMsg.value =
+      err?.response?.data?.msg
+      || err?.response?.data?.detail?.msg
       || err?.response?.data?.detail
       || err?.message
       || '上传失败，请重试'
     uploading.value = false
   }
-}
-
-// Poll health endpoint until backend comes back online
-let pollCount = 0
-const MAX_POLLS = 30 // 30 * 2s = 60s max wait
-
-function pollHealth() {
-  const check = async () => {
-    pollCount++
-    if (pollCount > MAX_POLLS) {
-      progressText.value = '后端重启超时，请手动刷新页面'
-      uploading.value = false
-      return
-    }
-    try {
-      const resp = await fetch('/api/v1/health', {
-        method: 'GET',
-        headers: { 'Cache-Control': 'no-cache' },
-      })
-      if (resp.ok) {
-        progressText.value = '后端已恢复，正在刷新页面...'
-        uploading.value = false
-        // Auto refresh after a short delay
-        setTimeout(() => {
-          window.location.reload()
-        }, 1000)
-        return
-      }
-    } catch {
-      // Backend still restarting
-    }
-    setTimeout(check, 2000)
-  }
-  setTimeout(check, 2000)
 }
 
 function handleClose() {
@@ -260,14 +260,12 @@ function handleClose() {
   progressText.value = ''
   errorMsg.value = ''
   successMsg.value = ''
-  pollCount = 0
   uploadRef.value?.clearFiles()
 }
 
-// Reset poll count when dialog opens
+// Reset state when dialog opens
 watch(() => props.modelValue, (val) => {
   if (val) {
-    pollCount = 0
     errorMsg.value = ''
     successMsg.value = ''
     progress.value = 0
