@@ -218,8 +218,10 @@ async def upload_plugin(
         # Clean up temp file on failure
         tmp_path.unlink(missing_ok=True)
         await _write_plugin_audit(db, user, "install", filename, started, error=str(exc))
+        exc_text = f"{type(exc).__name__}: {exc}"
+        sep = "" if exc_text.endswith(("。", ".", "！", "？")) else "。"
         raise ValidationException(
-            f"插件 '{filename}' 导入失败（manager）：{type(exc).__name__}: {exc}。"
+            f"插件 '{filename}' 导入失败（manager）：{exc_text}{sep}"
             "临时上传文件已清理；请根据错误信息修复后重试。"
         ) from exc
 
